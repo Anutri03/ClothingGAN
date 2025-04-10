@@ -29,6 +29,10 @@ from platform import system
 from PIL import Image
 from utils import pad_frames, prettify_name
 import pickle
+import gradio as gr
+import torch.nn.functional as F
+from datetime import datetime
+import os
 
 # For platform specific UI tweaks
 is_windows = 'Windows' in system()
@@ -640,16 +644,234 @@ def shutdown():
 def on_key_release(symbol, modifiers):
     handle_keypress(symbol)
 
-if __name__=='__main__':
-    setup_model()
-    setup_ui()
-    resample_latent()
+class InteractiveGAN:
+    def __init__(self):
+        self.setup_model()
+        
+    def setup_model(self):
+        """Initialize the model with CUDA support"""
+        print("Initializing model...")
+        assert torch.cuda.is_available(), 'Interactive mode requires CUDA'
+        
+        # Speed up PyTorch
+        torch.autograd.set_grad_enabled(False)
+        torch.backends.cudnn.benchmark = True
+        
+        # Model settings
+        self.model_name = "StyleGAN2"
+        self.class_name = "lookbook"
+        self.layer_name = "style"
+        
+        # Load model
+        self.device = torch.device('cuda')
+        self.inst = get_instrumented_model(
+            self.model_name, 
+            self.class_name,
+            self.layer_name,
+            self.device,
+            use_w=True
+        )
+        self.model = self.inst.model
+        self.model.eval()
+        
+        # Load components
+        self.load_components()
+        
+    def load_components(self):
+        """Load or compute PCA components"""
+        print("Loading components...")
+        config = Config().from_dict({
+            'output_class': self.class_name,
+            'layer': self.layer_name,
+            'components': 80,
+            'use_w': True,
+            'batch_size': 5000
+        })
+        
+        dump_name = get_or_compute(config, self.inst)
+        data = np.load(dump_name, allow_pickle=False)
+        
+        # Transfer components to GPU
+        self.components = {
+            'X_comp': torch.from_numpy(data['act_comp']).cuda(),
+            'X_mean': torch.from_numpy(data['act_mean']).cuda(),
+            'X_stdev': torch.from_numpy(data['act_stdev']).cuda(),
+            'Z_comp': torch.from_numpy(data['lat_comp']).cuda(),
+            'Z_stdev': torch.from_numpy(data['lat_stdev']).cuda(),
+            'Z_mean': torch.from_numpy(data['lat_mean']).cuda(),
+            'names': [
+                "Structure", "Style", "Pattern", "Length",
+                "Neckline", "Fit", "Color", "Texture"
+            ][:data['act_comp'].shape[0]]
+        }
+        data.close()
+        print("Components loaded successfully")
+    
+    def generate_image(self, seed=None, slider_values=None, truncation=0.7):
+        """Generate an image with given parameters"""
+        try:
+            if seed is not None:
+                torch.manual_seed(seed)
+            
+            # Generate random latent vector
+            z = torch.randn(1, self.components['Z_mean'].shape[0], device='cuda')
+            z = z.squeeze(0)
+            
+            # Apply component modifications
+            if slider_values:
+                for i, value in enumerate(slider_values):
+                    if value != 0:
+                        z += value * self.components['Z_stdev'][i] * self.components['Z_comp'][i]
+            
+            # Apply truncation trick
+            z = self.components['Z_mean'] + truncation * (z - self.components['Z_mean'])
+            
+            # Generate image
+            with torch.no_grad():
+                img = self.model(z.unsqueeze(0))
+                img = F.interpolate(img, size=(256, 256), mode='bilinear', align_corners=False)
+                img = ((img + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+                img = img[0].permute(1, 2, 0).cpu().numpy()
+            
+            return Image.fromarray(img)
+        except Exception as e:
+            print(f"Error generating image: {str(e)}")
+            return None
+    
+    def mix_images(self, seed1, seed2, mix_ratio, slider_values=None, truncation=0.7):
+        """Mix two images with given parameters"""
+        try:
+            # Generate first latent vector
+            torch.manual_seed(seed1)
+            z1 = torch.randn(1, self.components['Z_mean'].shape[0], device='cuda')
+            z1 = z1.squeeze(0)
+            
+            # Generate second latent vector
+            torch.manual_seed(seed2)
+            z2 = torch.randn(1, self.components['Z_mean'].shape[0], device='cuda')
+            z2 = z2.squeeze(0)
+            
+            # Apply component modifications
+            if slider_values:
+                for i, value in enumerate(slider_values):
+                    if value != 0:
+                        z1 += value * self.components['Z_stdev'][i] * self.components['Z_comp'][i]
+                        z2 += value * self.components['Z_stdev'][i] * self.components['Z_comp'][i]
+            
+            # Mix latent vectors
+            z_mixed = z1 * (1 - mix_ratio) + z2 * mix_ratio
+            
+            # Apply truncation
+            z_mixed = self.components['Z_mean'] + truncation * (z_mixed - self.components['Z_mean'])
+            
+            # Generate image
+            with torch.no_grad():
+                img = self.model(z_mixed.unsqueeze(0))
+                img = F.interpolate(img, size=(256, 256), mode='bilinear', align_corners=False)
+                img = ((img + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+                img = img[0].permute(1, 2, 0).cpu().numpy()
+            
+            return Image.fromarray(img)
+        except Exception as e:
+            print(f"Error mixing images: {str(e)}")
+            return None
+    
+    def create_interface(self):
+        """Create the Gradio interface"""
+        with gr.Blocks(title="ClothingGAN", theme=gr.themes.Soft()) as interface:
+            gr.Markdown("""
+            # 👕 ClothingGAN
+            Generate and mix unique clothing designs using the controls below.
+            """)
+            
+            with gr.Row():
+                # Left column - Image 1
+                with gr.Column():
+                    gr.Markdown("### Image 1")
+                    with gr.Row():
+                        seed1 = gr.Number(label="Seed 1", value=2, precision=0)
+                        seed1_random = gr.Button("🎲")
+                    preview1 = gr.Image(label="Preview 1", height=300)
+                    generate1 = gr.Button("🔄 Generate", variant="primary")
+                
+                # Middle column - Controls
+                with gr.Column():
+                    gr.Markdown("### Controls")
+                    mix_ratio = gr.Slider(0, 1, value=0.5, label="Mix Ratio")
+                    truncation = gr.Slider(0, 1, value=0.7, label="Truncation")
+                    mix_btn = gr.Button("🔀 Mix Images", variant="primary")
+                    mixed_output = gr.Image(label="Mixed Result", height=300)
+                    save_btn = gr.Button("💾 Save Result")
+                
+                # Right column - Image 2
+                with gr.Column():
+                    gr.Markdown("### Image 2")
+                    with gr.Row():
+                        seed2 = gr.Number(label="Seed 2", value=219497, precision=0)
+                        seed2_random = gr.Button("🎲")
+                    preview2 = gr.Image(label="Preview 2", height=300)
+                    generate2 = gr.Button("🔄 Generate", variant="primary")
+            
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### Component Controls")
+                    sliders = []
+                    for name in self.components['names'][:8]:  # Show first 8 components
+                        sliders.append(gr.Slider(-2, 2, value=0, label=name))
+            
+            # Event handlers
+            def random_seed():
+                return np.random.randint(0, 1_000_000)
+            
+            def generate(seed, *slider_values):
+                return self.generate_image(seed, slider_values)
+            
+            def mix(seed1, seed2, ratio, truncation, *slider_values):
+                return self.mix_images(seed1, seed2, ratio, slider_values, truncation)
+            
+            # Connect components
+            seed1_random.click(fn=random_seed, outputs=[seed1])
+            seed2_random.click(fn=random_seed, outputs=[seed2])
+            
+            generate1.click(fn=generate, inputs=[seed1] + sliders, outputs=[preview1])
+            generate2.click(fn=generate, inputs=[seed2] + sliders, outputs=[preview2])
+            
+            mix_btn.click(
+                fn=mix,
+                inputs=[seed1, seed2, mix_ratio, truncation] + sliders,
+                outputs=[mixed_output]
+            )
+            
+            def save_result(img):
+                if img is None:
+                    return "No image to save"
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_dir = f"output/interactive_{timestamp}"
+                os.makedirs(save_dir, exist_ok=True)
+                img_path = f"{save_dir}/result.png"
+                img.save(img_path)
+                return f"Saved to {img_path}"
+            
+            save_btn.click(fn=save_result, inputs=[mixed_output], outputs=gr.Textbox(label="Status"))
+        
+        return interface
 
-    pending_close = False
-    while not pending_close:
-        root.update()
-        app.update()
-        on_draw()
-        reposition_toolbar()
+def main():
+    try:
+        print("Starting InteractiveGAN...")
+        # Create interactive interface
+        gan = InteractiveGAN()
+        print("Created GAN interface")
+        interface = gan.create_interface()
+        print("Created Gradio interface")
+        
+        # Launch the interface
+        print("Launching interface...")
+        interface.launch(share=False)
+    except Exception as e:
+        print(f"Error occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
-    root.destroy()
+if __name__ == "__main__":
+    main()
